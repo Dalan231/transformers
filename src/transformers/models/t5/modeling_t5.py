@@ -33,7 +33,6 @@ from ...modeling_outputs import (
     Seq2SeqModelOutput,
     Seq2SeqQuestionAnsweringModelOutput,
     Seq2SeqSequenceClassifierOutput,
-    TokenClassifierOutput,
 )
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS, find_pruneable_heads_and_indices, prune_linear_layer
@@ -53,18 +52,18 @@ from .configuration_t5 import T5Config
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "T5Config"
-_CHECKPOINT_FOR_DOC = "google-t5/t5-small"
+_CHECKPOINT_FOR_DOC = "t5-small"
 
 ####################################################
 # This dict contains ids and associated url
 # for the pretrained weights provided with the models
 ####################################################
 T5_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "google-t5/t5-small",
-    "google-t5/t5-base",
-    "google-t5/t5-large",
-    "google-t5/t5-3b",
-    "google-t5/t5-11b",
+    "t5-small",
+    "t5-base",
+    "t5-large",
+    "t5-3b",
+    "t5-11b",
     # See all T5 models at https://huggingface.co/models?filter=t5
 ]
 
@@ -196,17 +195,17 @@ PARALLELIZE_DOCSTRING = r"""
             have fewer attention modules mapped to it than other devices. For reference, the t5 models have the
             following number of attention modules:
 
-                - google-t5/t5-small: 6
-                - google-t5/t5-base: 12
-                - google-t5/t5-large: 24
-                - google-t5/t5-3b: 24
-                - google-t5/t5-11b: 24
+                - t5-small: 6
+                - t5-base: 12
+                - t5-large: 24
+                - t5-3b: 24
+                - t5-11b: 24
 
     Example:
 
     ```python
-    # Here is an example of a device map on a machine with 4 GPUs using google-t5/t5-3b, which has a total of 24 attention modules:
-    model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-3b")
+    # Here is an example of a device map on a machine with 4 GPUs using t5-3b, which has a total of 24 attention modules:
+    model = T5ForConditionalGeneration.from_pretrained("t5-3b")
     device_map = {
         0: [0, 1, 2],
         1: [3, 4, 5, 6, 7, 8, 9],
@@ -222,8 +221,8 @@ DEPARALLELIZE_DOCSTRING = r"""
     Example:
 
     ```python
-    # On a 4 GPU machine with google-t5/t5-3b:
-    model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-3b")
+    # On a 4 GPU machine with t5-3b:
+    model = T5ForConditionalGeneration.from_pretrained("t5-3b")
     device_map = {
         0: [0, 1, 2],
         1: [3, 4, 5, 6, 7, 8, 9],
@@ -257,7 +256,7 @@ class T5LayerNorm(nn.Module):
         # convert into half-precision if necessary
         if self.weight.dtype in [torch.float16, torch.bfloat16]:
             hidden_states = hidden_states.to(self.weight.dtype)
-
+        hidden_states.to((self.weight).device)
         return self.weight * hidden_states
 
 
@@ -529,10 +528,11 @@ class T5Attention(nn.Module):
         )
 
         # compute scores
+        
         scores = torch.matmul(
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
-
+        
         if position_bias is None:
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
@@ -557,8 +557,11 @@ class T5Attention(nn.Module):
             position_bias_masked = position_bias[:, mask.bool()]
         else:
             position_bias_masked = position_bias
-
-        scores += position_bias_masked
+        
+        try:
+            scores += position_bias_masked
+        except RuntimeError:
+            print("ok")
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (batch_size, n_heads, seq_length, key_length)
@@ -648,6 +651,41 @@ class T5LayerCrossAttention(nn.Module):
         outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
         return outputs
 
+class T5NodeCrossAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.NodeAttention = T5Attention(config, has_relative_attention_bias=False)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(
+        self,
+        hidden_states,
+        key_value_states,
+        attention_mask=None,
+        position_bias=None,
+        layer_head_mask=None,
+        past_key_value=None,
+        use_cache=False,
+        query_length=None,
+        output_attentions=False,
+    ):
+        
+        normed_hidden_states = self.layer_norm(hidden_states)
+        attention_output = self.NodeAttention(
+            normed_hidden_states,
+            mask=attention_mask,
+            key_value_states=key_value_states,
+            position_bias=position_bias,
+            layer_head_mask=layer_head_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            query_length=query_length,
+            output_attentions=output_attentions,
+        )
+        layer_output = hidden_states + self.dropout(attention_output[0])
+        outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
+        return outputs
 
 class T5Block(nn.Module):
     def __init__(self, config, has_relative_attention_bias=False):
@@ -659,6 +697,9 @@ class T5Block(nn.Module):
             self.layer.append(T5LayerCrossAttention(config))
 
         self.layer.append(T5LayerFF(config))
+
+        if not self.is_decoder:
+            self.node_cross_attention = T5NodeCrossAttention(config)
 
     def forward(
         self,
@@ -674,6 +715,7 @@ class T5Block(nn.Module):
         use_cache=False,
         output_attentions=False,
         return_dict=True,
+        graph_batch=None,
     ):
         if past_key_value is not None:
             if not self.is_decoder:
@@ -712,6 +754,53 @@ class T5Block(nn.Module):
                 torch.finfo(hidden_states.dtype).max,
             )
             hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+        if not self.is_decoder:
+            # the actual query length is unknown for cross attention
+            # if using past key value states. Need to inject it here
+            if present_key_value_state is not None:
+                query_length = present_key_value_state[0].shape[2]
+            else:
+                query_length = None
+            # print("HS and Graph")
+            # print(hidden_states.shape)
+            # # tensor = torch.stack(list(graph_batch.values()))
+            
+            # # #tensor = torch.tensor(graph_batch)
+            
+            # # # Reshape the tensor to shape (1, 1, 768)
+            # # reshaped_tensor = tensor.unsqueeze(0)
+            print(type(graph_batch))
+            print(len(graph_batch))
+            graph_batch = graph_batch.squeeze(dim=1)
+            cross_attention_outputs = self.node_cross_attention(
+                hidden_states,
+                key_value_states=graph_batch,
+                attention_mask=encoder_attention_mask,
+                position_bias=encoder_decoder_position_bias,
+                layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=cross_attn_past_key_value,
+                query_length=query_length,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+            hidden_states = cross_attention_outputs[0]
+            
+
+            # clamp inf values to enable fp16 training
+            if hidden_states.dtype == torch.float16:
+                clamp_value = torch.where(
+                    torch.isinf(hidden_states).any(),
+                    torch.finfo(hidden_states.dtype).max - 1000,
+                    torch.finfo(hidden_states.dtype).max,
+                )
+                hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+            # Combine self attn and cross attn key value states
+            if present_key_value_state is not None:
+                present_key_value_state = present_key_value_state + cross_attention_outputs[1]
+
+            # Keep cross-attention outputs and relative position weights
+            attention_outputs = attention_outputs + cross_attention_outputs[2:]
 
         do_cross_attention = self.is_decoder and encoder_hidden_states is not None
         if do_cross_attention:
@@ -733,6 +822,7 @@ class T5Block(nn.Module):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
             )
+
             hidden_states = cross_attention_outputs[0]
 
             # clamp inf values to enable fp16 training
@@ -833,10 +923,6 @@ class T5PreTrainedModel(PreTrainedModel):
             if hasattr(module, "qa_outputs"):
                 module.qa_outputs.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
                 module.qa_outputs.bias.data.zero_()
-        elif isinstance(module, T5ForTokenClassification):
-            if hasattr(module, "classifier"):
-                module.classifier.weight.data.normal_(mean=0.0, std=factor * 1.0)
-                module.classifier.bias.data.zero_()
         elif isinstance(module, T5ClassificationHead):
             module.dense.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.dense, "bias") and module.dense.bias is not None:
@@ -989,6 +1075,7 @@ class T5Stack(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        graph_batch=None,
     ):
         # Model parallel
         if self.model_parallel:
@@ -1043,6 +1130,7 @@ class T5Stack(T5PreTrainedModel):
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if self.is_decoder and encoder_hidden_states is not None:
+            print(encoder_hidden_states.size())
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
             if encoder_attention_mask is None:
@@ -1110,6 +1198,7 @@ class T5Stack(T5PreTrainedModel):
                     None,  # past_key_value is always None with gradient checkpointing
                     use_cache,
                     output_attentions,
+                    graph_batch=graph_batch,
                 )
             else:
                 layer_outputs = layer_module(
@@ -1124,6 +1213,7 @@ class T5Stack(T5PreTrainedModel):
                     past_key_value=past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    graph_batch=graph_batch,
                 )
 
             # layer_outputs is a tuple with:
@@ -1463,8 +1553,8 @@ class T5Model(T5PreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, T5Model
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-        >>> model = T5Model.from_pretrained("google-t5/t5-small")
+        >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        >>> model = T5Model.from_pretrained("t5-small")
 
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
@@ -1664,6 +1754,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        graph_batch=None,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1678,8 +1769,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, T5ForConditionalGeneration
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-        >>> model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+        >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        >>> model = T5ForConditionalGeneration.from_pretrained("t5-small")
 
         >>> # training
         >>> input_ids = tokenizer("The <extra_id_0> walks in <extra_id_1> park", return_tensors="pt").input_ids
@@ -1696,6 +1787,12 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
         >>> # studies have shown that owning a dog is good for you.
         ```"""
+        # if graph_batch==None:
+        #     print("no graph batch")
+        # else:
+        #     print("graph batch passed")
+        #     print(type(graph_batch))
+        #     print(graph_batch.shape)
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1716,6 +1813,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                graph_batch=graph_batch,
             )
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
@@ -1967,8 +2065,8 @@ class T5EncoderModel(T5PreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, T5EncoderModel
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-        >>> model = T5EncoderModel.from_pretrained("google-t5/t5-small")
+        >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        >>> model = T5EncoderModel.from_pretrained("t5-small")
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
         ... ).input_ids  # Batch size 1
@@ -2120,78 +2218,6 @@ class T5ForSequenceClassification(T5PreTrainedModel):
             encoder_last_hidden_state=outputs.encoder_last_hidden_state,
             encoder_hidden_states=outputs.encoder_hidden_states,
             encoder_attentions=outputs.encoder_attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-    T5 Encoder Model with a token classification head on top (a linear layer on top of the hidden-states output)
-    e.g. for Named-Entity-Recognition (NER) tasks.
-    """,
-    T5_START_DOCSTRING,
-)
-class T5ForTokenClassification(T5PreTrainedModel):
-    _tied_weights_keys = ["transformer.encoder.embed_tokens.weight"]
-
-    def __init__(self, config: T5Config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-
-        self.transformer = T5EncoderModel(config)
-        self.dropout = nn.Dropout(config.classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(T5_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=TokenClassifierOutput, config_class=_CONFIG_FOR_DOC)
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], TokenClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
-        Returns:
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = outputs[0]
-        hidden_states = self.dropout(hidden_states)
-        logits = self.classifier(hidden_states)
-
-        loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
-        if not return_dict:
-            output = (logits, outputs[2:-1])
-            return ((loss,) + output) if loss is not None else output
-
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
         )
 
 
