@@ -671,6 +671,8 @@ class T5NodeCrossAttention(nn.Module):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.NodeAttention(
             normed_hidden_states,
+            graph_batch,
+            normed_hidden_states,
             mask=attention_mask,
             key_value_states=key_value_states,
             position_bias=position_bias,
