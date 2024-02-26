@@ -769,7 +769,7 @@ class T5Block(nn.Module):
             # # reshaped_tensor = tensor.unsqueeze(0)
             #print(type(graph_batch))
             #print(len(graph_batch))
-            graph_batch = graph_batch.squeeze(dim=1)
+            #graph_batch = graph_batch.squeeze(dim=1)
             cross_attention_outputs = self.node_cross_attention(
                 hidden_states,
                 key_value_states=graph_batch,
