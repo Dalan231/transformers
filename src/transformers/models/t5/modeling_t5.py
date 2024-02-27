@@ -768,9 +768,9 @@ class T5Block(nn.Module):
             # # # Reshape the tensor to shape (1, 1, 768)
             # # reshaped_tensor = tensor.unsqueeze(0)
             
-            print(type(graph_batch))
-            print(len(graph_batch))
-            print(graph_batch)
+            # print(type(graph_batch))
+            # print(len(graph_batch))
+            # print(graph_batch)
             #graph_batch = graph_batch.squeeze(dim=1)
             cross_attention_outputs = self.node_cross_attention(
                 hidden_states,
